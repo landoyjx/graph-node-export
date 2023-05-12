@@ -30,6 +30,7 @@ use graph::data::query::Trace;
 use graph::data::value::Word;
 use graph::data_source::CausalityRegion;
 use graph::prelude::{q, s, EntityQuery, StopwatchMetrics, ENV_VARS};
+use graph::schema::{FulltextConfig, FulltextDefinition, InputSchema, SCHEMA_TYPE_NAME};
 use graph::slog::warn;
 use inflector::Inflector;
 use lazy_static::lazy_static;
@@ -50,10 +51,9 @@ use crate::{
     },
 };
 use graph::components::store::{DerivedEntityQuery, EntityKey, EntityType};
-use graph::data::graphql::ext::{DirectiveFinder, DocumentExt, ObjectTypeExt};
-use graph::data::schema::{FulltextConfig, FulltextDefinition, Schema, SCHEMA_TYPE_NAME};
+use graph::data::graphql::ext::{DirectiveFinder, ObjectTypeExt};
 use graph::data::store::BYTES_SCALAR;
-use graph::data::subgraph::schema::{POI_OBJECT, POI_TABLE};
+use graph::data::subgraph::schema::{POI_DIGEST, POI_OBJECT, POI_TABLE};
 use graph::prelude::{
     anyhow, info, BlockNumber, DeploymentHash, Entity, EntityChange, EntityOperation, Logger,
     QueryExecutionError, StoreError, StoreEvent, ValueType, BLOCK_NUMBER_MAX,
@@ -249,16 +249,21 @@ pub struct Layout {
     pub count_query: String,
     /// How many blocks of history the subgraph should keep
     pub history_blocks: BlockNumber,
+
+    pub input_schema: InputSchema,
 }
 
 impl Layout {
     /// Generate a layout for a relational schema for entities in the
     /// GraphQL schema `schema`. The name of the database schema in which
     /// the subgraph's tables live is in `site`.
-    pub fn new(site: Arc<Site>, schema: &Schema, catalog: Catalog) -> Result<Self, StoreError> {
+    pub fn new(
+        site: Arc<Site>,
+        schema: &InputSchema,
+        catalog: Catalog,
+    ) -> Result<Self, StoreError> {
         // Extract enum types
         let enums: EnumMap = schema
-            .document
             .get_enum_definitions()
             .iter()
             .map(
@@ -280,7 +285,6 @@ impl Layout {
 
         // List of all object types that are not __SCHEMA__
         let object_types = schema
-            .document
             .get_object_type_definitions()
             .into_iter()
             .filter(|obj_type| obj_type.name != SCHEMA_TYPE_NAME)
@@ -288,7 +292,7 @@ impl Layout {
 
         // For interfaces, check that all implementors use the same IdType
         // and build a list of name/IdType pairs
-        let id_types_for_interface = schema.types_for_interface.iter().map(|(interface, types)| {
+        let id_types_for_interface = schema.interface_types().iter().map(|(interface, types)| {
             types
                 .iter()
                 .map(IdType::try_from)
@@ -327,7 +331,8 @@ impl Layout {
                 Table::new(
                     obj_type,
                     &catalog,
-                    Schema::entity_fulltext_definitions(&obj_type.name, &schema.document)
+                    schema
+                        .entity_fulltext_definitions(&obj_type.name)
                         .map_err(|_| StoreError::FulltextSearchNonDeterministic)?,
                     &enums,
                     &id_types,
@@ -377,6 +382,7 @@ impl Layout {
             enums,
             count_query,
             history_blocks: i32::MAX,
+            input_schema: schema.cheap_clone(),
         })
     }
 
@@ -388,8 +394,8 @@ impl Layout {
             name: table_name,
             columns: vec![
                 Column {
-                    name: SqlName::from("digest"),
-                    field: "digest".to_owned(),
+                    name: SqlName::from(POI_DIGEST.as_str()),
+                    field: POI_DIGEST.to_string(),
                     field_type: q::Type::NonNullType(Box::new(q::Type::NamedType(
                         BYTES_SCALAR.to_owned(),
                     ))),
@@ -427,7 +433,7 @@ impl Layout {
     pub fn create_relational_schema(
         conn: &PgConnection,
         site: Arc<Site>,
-        schema: &Schema,
+        schema: &InputSchema,
         entities_with_causality_region: BTreeSet<EntityType>,
     ) -> Result<Layout, StoreError> {
         let catalog = Catalog::for_creation(site.cheap_clone(), entities_with_causality_region);
@@ -515,7 +521,7 @@ impl Layout {
         FindQuery::new(table.as_ref(), key, block)
             .get_result::<EntityData>(conn)
             .optional()?
-            .map(|entity_data| entity_data.deserialize_with_layout(self, None, true))
+            .map(|entity_data| entity_data.deserialize_with_layout(self, None))
             .transpose()
     }
 
@@ -543,11 +549,11 @@ impl Layout {
         let mut entities: BTreeMap<EntityKey, Entity> = BTreeMap::new();
         for data in query.load::<EntityData>(conn)? {
             let entity_type = data.entity_type();
-            let entity_data: Entity = data.deserialize_with_layout(self, None, true)?;
+            let entity_data: Entity = data.deserialize_with_layout(self, None)?;
 
             let key = EntityKey {
                 entity_type,
-                entity_id: entity_data.id()?.into(),
+                entity_id: entity_data.id(),
                 causality_region: CausalityRegion::from_entity(&entity_data),
             };
             let overwrite = entities.insert(key, entity_data).is_some();
@@ -572,10 +578,10 @@ impl Layout {
 
         for data in query.load::<EntityData>(conn)? {
             let entity_type = data.entity_type();
-            let entity_data: Entity = data.deserialize_with_layout(self, None, true)?;
+            let entity_data: Entity = data.deserialize_with_layout(self, None)?;
             let key = EntityKey {
                 entity_type,
-                entity_id: entity_data.id()?.into(),
+                entity_id: entity_data.id(),
                 causality_region: CausalityRegion::from_entity(&entity_data),
             };
 
@@ -608,8 +614,8 @@ impl Layout {
 
         for entity_data in inserts_or_updates.into_iter() {
             let entity_type = entity_data.entity_type();
-            let data: Entity = entity_data.deserialize_with_layout(self, None, true)?;
-            let entity_id = Word::from(data.id().expect("Invalid ID for entity."));
+            let data: Entity = entity_data.deserialize_with_layout(self, None)?;
+            let entity_id = data.id();
             processed_entities.insert((entity_type.clone(), entity_id.clone()));
 
             changes.push(EntityOperation::Set {
@@ -783,7 +789,7 @@ impl Layout {
             .into_iter()
             .map(|entity_data| {
                 entity_data
-                    .deserialize_with_layout(self, parent_type.as_ref(), false)
+                    .deserialize_with_layout(self, parent_type.as_ref())
                     .map_err(|e| e.into())
             })
             .collect::<Result<Vec<T>, _>>()

@@ -28,7 +28,11 @@ pub mod firehose;
 
 pub mod substreams;
 
+pub mod substreams_rpc;
+
 pub mod endpoint;
+
+pub mod schema;
 
 /// Helpers for parsing environment variables.
 pub mod env;
@@ -60,7 +64,6 @@ pub use url;
 /// use graph::prelude::*;
 /// ```
 pub mod prelude {
-    pub use super::entity;
     pub use ::anyhow;
     pub use anyhow::{anyhow, Context as _, Error};
     pub use async_trait::async_trait;
@@ -146,12 +149,10 @@ pub mod prelude {
     pub use crate::data::query::{
         Query, QueryError, QueryExecutionError, QueryResult, QueryTarget, QueryVariables,
     };
-    pub use crate::data::schema::{ApiSchema, Schema};
     pub use crate::data::store::ethereum::*;
     pub use crate::data::store::scalar::{BigDecimal, BigInt, BigIntSign};
     pub use crate::data::store::{
-        AssignmentEvent, Attribute, Entity, NodeId, SubscriptionFilter, TryIntoEntity, Value,
-        ValueType,
+        AssignmentEvent, Attribute, Entity, NodeId, SubscriptionFilter, Value, ValueType,
     };
     pub use crate::data::subgraph::schema::SubgraphDeploymentEntity;
     pub use crate::data::subgraph::{

@@ -13,16 +13,17 @@ use diesel::sql_types::{Array, BigInt, Binary, Bool, Integer, Jsonb, Text};
 use diesel::Connection;
 
 use graph::components::store::{DerivedEntityQuery, EntityKey};
-use graph::data::value::Word;
+use graph::data::value::{Object, Word};
 use graph::data_source::CausalityRegion;
 use graph::prelude::{
     anyhow, r, serde_json, Attribute, BlockNumber, ChildMultiplicity, Entity, EntityCollection,
     EntityFilter, EntityLink, EntityOrder, EntityOrderByChild, EntityOrderByChildInfo, EntityRange,
     EntityWindow, ParentLink, QueryExecutionError, StoreError, Value, ENV_VARS,
 };
+use graph::schema::{FulltextAlgorithm, InputSchema};
 use graph::{
     components::store::{AttributeNames, EntityType},
-    data::{schema::FulltextAlgorithm, store::scalar},
+    data::store::scalar,
 };
 use itertools::Itertools;
 use std::borrow::Cow;
@@ -36,7 +37,6 @@ use crate::relational::{
     Column, ColumnType, IdType, Layout, SqlName, Table, BYTE_ARRAY_PREFIX_SIZE, PRIMARY_KEY_COLUMN,
     STRING_PREFIX_SIZE,
 };
-use crate::sql_value::SqlValue;
 use crate::{
     block_range::{
         BlockRangeColumn, BlockRangeLowerBoundClause, BlockRangeUpperBoundClause, BLOCK_COLUMN,
@@ -238,39 +238,41 @@ impl ForeignKeyClauses for Column {
     }
 }
 
-pub trait FromEntityData: std::fmt::Debug + std::default::Default {
+pub trait FromEntityData: Sized {
+    /// Whether to include the internal keys `__typename` and `g$parent_id`.
+    const WITH_INTERNAL_KEYS: bool;
+
     type Value: FromColumnValue;
 
-    fn new_entity(typename: String) -> Self;
-
-    fn insert_entity_data(&mut self, key: String, v: Self::Value);
+    fn from_data<I: Iterator<Item = Result<(Word, Self::Value), StoreError>>>(
+        schema: &InputSchema,
+        iter: I,
+    ) -> Result<Self, StoreError>;
 }
 
 impl FromEntityData for Entity {
+    const WITH_INTERNAL_KEYS: bool = false;
+
     type Value = graph::prelude::Value;
 
-    fn new_entity(typename: String) -> Self {
-        let mut entity = Entity::new();
-        entity.insert("__typename".to_string(), Self::Value::String(typename));
-        entity
-    }
-
-    fn insert_entity_data(&mut self, key: String, v: Self::Value) {
-        self.insert(key, v);
+    fn from_data<I: Iterator<Item = Result<(Word, Self::Value), StoreError>>>(
+        schema: &InputSchema,
+        iter: I,
+    ) -> Result<Self, StoreError> {
+        schema.try_make_entity(iter).map_err(StoreError::from)
     }
 }
 
-impl FromEntityData for BTreeMap<Word, r::Value> {
+impl FromEntityData for Object {
+    const WITH_INTERNAL_KEYS: bool = true;
+
     type Value = r::Value;
 
-    fn new_entity(typename: String) -> Self {
-        let mut map = BTreeMap::new();
-        map.insert("__typename".into(), Self::Value::from_string(typename));
-        map
-    }
-
-    fn insert_entity_data(&mut self, key: String, v: Self::Value) {
-        self.insert(Word::from(key), v);
+    fn from_data<I: Iterator<Item = Result<(Word, Self::Value), StoreError>>>(
+        _schema: &InputSchema,
+        iter: I,
+    ) -> Result<Self, StoreError> {
+        <Result<Object, StoreError> as FromIterator<Result<(Word, Self::Value), StoreError>>>::from_iter(iter)
     }
 }
 
@@ -490,46 +492,54 @@ impl EntityData {
         self,
         layout: &Layout,
         parent_type: Option<&ColumnType>,
-        remove_typename: bool,
     ) -> Result<T, StoreError> {
-        let entity_type = EntityType::new(self.entity);
+        let entity_type = EntityType::new(self.entity.clone());
         let table = layout.table_for_entity(&entity_type)?;
 
         use serde_json::Value as j;
         match self.data {
             j::Object(map) => {
-                let mut out = if !remove_typename {
-                    T::new_entity(entity_type.into_string())
-                } else {
-                    T::default()
-                };
-                for (key, json) in map {
+                let typname = std::iter::once(self.entity).filter_map(move |e| {
+                    if T::WITH_INTERNAL_KEYS {
+                        Some(Ok((Word::from("__typename"), T::Value::from_string(e))))
+                    } else {
+                        None
+                    }
+                });
+                let entries = map.into_iter().filter_map(move |(key, json)| {
                     // Simply ignore keys that do not have an underlying table
                     // column; those will be things like the block_range that
                     // is used internally for versioning
                     if key == "g$parent_id" {
-                        match &parent_type {
-                            None => {
-                                // A query that does not have parents
-                                // somehow returned parent ids. We have no
-                                // idea how to deserialize that
-                                return Err(graph::constraint_violation!(
-                                    "query unexpectedly produces parent ids"
-                                ));
+                        if T::WITH_INTERNAL_KEYS {
+                            match &parent_type {
+                                None => {
+                                    // A query that does not have parents
+                                    // somehow returned parent ids. We have no
+                                    // idea how to deserialize that
+                                    Some(Err(graph::constraint_violation!(
+                                        "query unexpectedly produces parent ids"
+                                    )))
+                                }
+                                Some(parent_type) => Some(
+                                    T::Value::from_column_value(parent_type, json)
+                                        .map(|value| (Word::from("g$parent_id"), value)),
+                                ),
                             }
-                            Some(parent_type) => {
-                                let value = T::Value::from_column_value(parent_type, json)?;
-                                out.insert_entity_data("g$parent_id".to_owned(), value);
-                            }
+                        } else {
+                            None
                         }
                     } else if let Some(column) = table.column(&SqlName::verbatim(key)) {
-                        let value = T::Value::from_column_value(&column.column_type, json)?;
-                        if !value.is_null() {
-                            out.insert_entity_data(column.field.clone(), value);
+                        match T::Value::from_column_value(&column.column_type, json) {
+                            Ok(value) if value.is_null() => None,
+                            Ok(value) => Some(Ok((Word::from(column.field.to_string()), value))),
+                            Err(e) => Some(Err(e)),
                         }
+                    } else {
+                        None
                     }
-                }
-                Ok(out)
+                });
+                T::from_data(&layout.input_schema, typname.chain(entries))
             }
             _ => unreachable!(
                 "we use `to_json` in our queries, and will therefore always get an object back"
@@ -579,7 +589,6 @@ impl<'a> QueryFragment<Pg> for QueryValue<'a> {
             }
             Value::Bool(b) => out.push_bind_param::<Bool, _>(b),
             Value::List(values) => {
-                let sql_values = SqlValue::new_array(values.clone());
                 match &column_type {
                     ColumnType::BigDecimal | ColumnType::BigInt => {
                         let text_values: Vec<_> = values.iter().map(|v| v.to_string()).collect();
@@ -587,12 +596,12 @@ impl<'a> QueryFragment<Pg> for QueryValue<'a> {
                         out.push_sql("::numeric[]");
                         Ok(())
                     }
-                    ColumnType::Boolean => out.push_bind_param::<Array<Bool>, _>(&sql_values),
-                    ColumnType::Bytes => out.push_bind_param::<Array<Binary>, _>(&sql_values),
-                    ColumnType::Int => out.push_bind_param::<Array<Integer>, _>(&sql_values),
-                    ColumnType::String => out.push_bind_param::<Array<Text>, _>(&sql_values),
+                    ColumnType::Boolean => out.push_bind_param::<Array<Bool>, _>(values),
+                    ColumnType::Bytes => out.push_bind_param::<Array<Binary>, _>(values),
+                    ColumnType::Int => out.push_bind_param::<Array<Integer>, _>(values),
+                    ColumnType::String => out.push_bind_param::<Array<Text>, _>(values),
                     ColumnType::Enum(enum_type) => {
-                        out.push_bind_param::<Array<Text>, _>(&sql_values)?;
+                        out.push_bind_param::<Array<Text>, _>(values)?;
                         out.push_sql("::");
                         out.push_sql(enum_type.name.as_str());
                         out.push_sql("[]");
@@ -600,11 +609,11 @@ impl<'a> QueryFragment<Pg> for QueryValue<'a> {
                     }
                     // TSVector will only be in a Value::List() for inserts so "to_tsvector" can always be used here
                     ColumnType::TSVector(config) => {
-                        if sql_values.is_empty() {
+                        if values.is_empty() {
                             out.push_sql("''::tsvector");
                         } else {
                             out.push_sql("(");
-                            for (i, value) in sql_values.iter().enumerate() {
+                            for (i, value) in values.iter().enumerate() {
                                 if i > 0 {
                                     out.push_sql(") || ");
                                 }
@@ -1753,6 +1762,7 @@ impl<'a> InsertQuery<'a> {
         block: BlockNumber,
     ) -> Result<InsertQuery<'a>, StoreError> {
         for (entity_key, entity) in entities.iter_mut() {
+            let mut fulltext = Vec::new();
             for column in table.columns.iter() {
                 if let Some(fields) = column.fulltext_fields.as_ref() {
                     let fulltext_field_values = fields
@@ -1761,9 +1771,7 @@ impl<'a> InsertQuery<'a> {
                         .cloned()
                         .collect::<Vec<Value>>();
                     if !fulltext_field_values.is_empty() {
-                        entity
-                            .to_mut()
-                            .insert(column.field.to_string(), Value::List(fulltext_field_values));
+                        fulltext.push((&column.field, Value::List(fulltext_field_values)));
                     }
                 }
                 if !column.is_nullable() && !entity.contains_key(&column.field) {
@@ -1774,6 +1782,9 @@ impl<'a> InsertQuery<'a> {
                     entity_key.entity_type, entity_key.entity_id, column.field
                 )));
                 }
+            }
+            if !fulltext.is_empty() {
+                entity.to_mut().merge_iter(fulltext)?;
             }
         }
         let unique_columns = InsertQuery::unique_columns(table, entities);

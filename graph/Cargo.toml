@@ -7,7 +7,7 @@ edition.workspace = true
 anyhow = "1.0"
 async-trait = "0.1.50"
 async-stream = "0.3"
-atomic_refcell = "0.1.9"
+atomic_refcell = "0.1.10"
 bigdecimal = { version = "0.1.0", features = ["serde"] }
 bytes = "1.0.1"
 cid = "0.10.1"
@@ -33,7 +33,7 @@ semver = { version = "1.0.16", features = ["serde"] }
 serde = { version = "1.0.126", features = ["rc"] }
 serde_derive = "1.0.125"
 serde_json = { version = "1.0", features = ["arbitrary_precision"] }
-serde_yaml = "0.8"
+serde_yaml = "0.9.21"
 slog = { version = "2.7.0", features = ["release_max_level_trace", "max_level_trace"] }
 stable-hash_legacy = { version = "0.3.3", package = "stable-hash" }
 stable-hash = { version = "0.4.2" }
@@ -44,8 +44,8 @@ slog-envlogger = "2.1.0"
 slog-term = "2.7.0"
 petgraph = "0.6.3"
 tiny-keccak = "1.5.0"
-tokio = { version = "1.26.0", features = ["time", "sync", "macros", "test-util", "rt-multi-thread", "parking_lot"] }
-tokio-stream = { version = "0.1.12", features = ["sync"] }
+tokio = { version = "1.28.0", features = ["time", "sync", "macros", "test-util", "rt-multi-thread", "parking_lot"] }
+tokio-stream = { version = "0.1.14", features = ["sync"] }
 tokio-retry = "0.3.0"
 url = "2.3.1"
 prometheus = "0.13.3"
@@ -66,12 +66,9 @@ web3 = { git = "https://github.com/graphprotocol/rust-web3", branch = "graph-pat
 serde_plain = "1.0.1"
 
 [dev-dependencies]
-test-store = { path = "../store/test-store" }
-graph-store-postgres = { path = "../store/postgres" }
-graph-chain-ethereum = { path = "../chain/ethereum" }
-clap = { version = "3.2.23", features = ["derive", "env"] }
+clap = { version = "3.2.25", features = ["derive", "env"] }
 maplit = "1.0.2"
-hex-literal = "0.3"
+hex-literal = "0.4"
 
 [build-dependencies]
 tonic-build = { workspace = true }

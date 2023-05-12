@@ -151,6 +151,7 @@ pub async fn run(
         Arc::new(EthereumRuntimeAdapter {
             call_cache: chain_store.cheap_clone(),
             eth_adapters: Arc::new(eth_adapters2),
+            chain_identifier: Arc::new(chain_store.chain_identifier.clone()),
         }),
         graph::env::ENV_VARS.reorg_threshold,
         ethereum::ENV_VARS.ingestor_polling_interval,
@@ -229,6 +230,7 @@ pub async fn run(
         subgraph_name.clone(),
         subgraph_hash.clone(),
         node_id.clone(),
+        None,
         None,
         None,
         None,

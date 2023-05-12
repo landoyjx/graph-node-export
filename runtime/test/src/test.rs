@@ -1,13 +1,18 @@
 use graph::data::store::scalar;
 use graph::data::subgraph::*;
+use graph::data::value::Word;
 use graph::prelude::web3::types::U256;
-use graph::prelude::*;
-use graph::runtime::{AscIndexId, AscType};
+use graph::runtime::gas::GasCounter;
+use graph::runtime::{AscIndexId, AscType, HostExportError};
 use graph::runtime::{AscPtr, ToAscObj};
+use graph::schema::InputSchema;
 use graph::{components::store::*, ipfs_client::IpfsClient};
+use graph::{entity, prelude::*};
 use graph_chain_ethereum::{Chain, DataSource};
 use graph_runtime_wasm::asc_abi::class::{Array, AscBigInt, AscEntity, AscString, Uint8Array};
-use graph_runtime_wasm::{ExperimentalFeatures, ValidModule, WasmInstance};
+use graph_runtime_wasm::{
+    host_exports, ExperimentalFeatures, MappingContext, ValidModule, WasmInstance,
+};
 
 use semver::Version;
 use std::collections::{BTreeMap, HashMap};
@@ -70,6 +75,7 @@ async fn test_valid_module_and_store_with_timeout(
         "type User @entity {
             id: ID!,
             name: String,
+            count: BigInt,
         }
 
         type Thing @entity {
@@ -298,7 +304,7 @@ async fn test_json_conversions(api_version: Version, gas_used: u64) {
 
     assert_eq!(
         scalar::BigInt::from_str(number).unwrap(),
-        scalar::BigInt::from_signed_bytes_le(&bytes)
+        scalar::BigInt::from_signed_bytes_le(&bytes).unwrap()
     );
 
     assert_eq!(module.gas_used(), gas_used);
@@ -325,13 +331,6 @@ async fn test_json_parsing(api_version: Version, gas_used: u64) {
     )
     .await;
 
-    // Parse invalid JSON and handle the error gracefully
-    let s = "foo"; // Invalid because there are no quotes around `foo`
-    let bytes: &[u8] = s.as_ref();
-    let return_value: AscPtr<AscString> = module.invoke_export1("handleJsonError", bytes);
-    let output: String = module.asc_get(return_value).unwrap();
-    assert_eq!(output, "ERROR: true");
-
     // Parse valid JSON and get it back
     let s = "\"foo\""; // Valid because there are quotes around `foo`
     let bytes: &[u8] = s.as_ref();
@@ -340,16 +339,31 @@ async fn test_json_parsing(api_version: Version, gas_used: u64) {
     let output: String = module.asc_get(return_value).unwrap();
     assert_eq!(output, "OK: foo, ERROR: false");
     assert_eq!(module.gas_used(), gas_used);
+
+    // Parse invalid JSON and handle the error gracefully
+    let s = "foo"; // Invalid because there are no quotes around `foo`
+    let bytes: &[u8] = s.as_ref();
+    let return_value: AscPtr<AscString> = module.invoke_export1("handleJsonError", bytes);
+    let output: String = module.asc_get(return_value).unwrap();
+    assert_eq!(output, "ERROR: true");
+
+    // Parse JSON that's too long and handle the error gracefully
+    let s = format!("\"f{}\"", "o".repeat(10_000_000));
+    let bytes: &[u8] = s.as_ref();
+    let return_value: AscPtr<AscString> = module.invoke_export1("handleJsonError", bytes);
+
+    let output: String = module.asc_get(return_value).unwrap();
+    assert_eq!(output, "ERROR: true");
 }
 
 #[tokio::test]
 async fn json_parsing_v0_0_4() {
-    test_json_parsing(API_VERSION_0_0_4, 2722284).await;
+    test_json_parsing(API_VERSION_0_0_4, 4373087).await;
 }
 
 #[tokio::test]
 async fn json_parsing_v0_0_5() {
-    test_json_parsing(API_VERSION_0_0_5, 3862933).await;
+    test_json_parsing(API_VERSION_0_0_5, 5153540).await;
 }
 
 async fn test_ipfs_cat(api_version: Version) {
@@ -418,10 +432,11 @@ async fn test_ipfs_block() {
 const USER_DATA: &str = "user_data";
 
 fn make_thing(id: &str, value: &str) -> (String, EntityModification) {
-    let mut data = Entity::new();
-    data.set("id", id);
-    data.set("value", value);
-    data.set("extra", USER_DATA);
+    const DOCUMENT: &str = " type Thing @entity { id: String!, value: String!, extra: String }";
+    lazy_static! {
+        static ref SCHEMA: InputSchema = InputSchema::raw(DOCUMENT, "doesntmatter");
+    }
+    let data = entity! { SCHEMA => id: id, value: value, extra: USER_DATA };
     let key = EntityKey::data("Thing".to_string(), id);
     (
         format!("{{ \"id\": \"{}\", \"value\": \"{}\"}}", id, value),
@@ -680,6 +695,31 @@ async fn test_big_int_to_hex(api_version: Version, gas_used: u64) {
 }
 
 #[tokio::test]
+async fn test_big_int_size_limit() {
+    let module = test_module(
+        "BigIntSizeLimit",
+        mock_data_source(
+            &wasm_file_path("big_int_size_limit.wasm", API_VERSION_0_0_5),
+            API_VERSION_0_0_5,
+        ),
+        API_VERSION_0_0_5,
+    )
+    .await;
+
+    let len = BigInt::MAX_BITS / 8;
+    module
+        .invoke_export1_val_void("bigIntWithLength", len)
+        .unwrap();
+
+    let len = BigInt::MAX_BITS / 8 + 1;
+    assert!(module
+        .invoke_export1_val_void("bigIntWithLength", len)
+        .unwrap_err()
+        .to_string()
+        .contains("BigInt is too big, total bits 435416 (max 435412)"));
+}
+
+#[tokio::test]
 async fn big_int_to_hex_v0_0_4() {
     test_big_int_to_hex(API_VERSION_0_0_4, 53113760).await;
 }
@@ -923,12 +963,10 @@ async fn test_entity_store(api_version: Version) {
     )
     .await;
 
-    let mut alex = Entity::new();
-    alex.set("id", "alex");
-    alex.set("name", "Alex");
-    let mut steve = Entity::new();
-    steve.set("id", "steve");
-    steve.set("name", "Steve");
+    let schema = store.input_schema(&deployment.hash).unwrap();
+
+    let alex = entity! { schema => id: "alex", name: "Alex" };
+    let steve = entity! { schema => id: "steve", name: "Steve" };
     let user_type = EntityType::from("User");
     test_store::insert_entities(
         &deployment,
@@ -942,11 +980,15 @@ async fn test_entity_store(api_version: Version) {
         if entity_ptr.is_null() {
             None
         } else {
-            Some(Entity::from(
-                module
-                    .asc_get::<HashMap<String, Value>, _>(entity_ptr)
+            Some(
+                schema
+                    .make_entity(
+                        module
+                            .asc_get::<HashMap<Word, Value>, _>(entity_ptr)
+                            .unwrap(),
+                    )
                     .unwrap(),
-            ))
+            )
         }
     };
 
@@ -1156,4 +1198,195 @@ async fn test_boolean() {
             .invoke_export1_val_void("testReceiveFalse", x)
             .is_err());
     }
+}
+
+#[tokio::test]
+async fn recursion_limit() {
+    let module = test_module_latest("RecursionLimit", "recursion_limit.wasm").await;
+
+    // An error about 'unknown key' means the entity was fully read with no stack overflow.
+    module
+        .invoke_export1_val_void("recursionLimit", 128)
+        .unwrap_err()
+        .to_string()
+        .contains("Unknown key `foobar`");
+
+    assert!(module
+        .invoke_export1_val_void("recursionLimit", 129)
+        .unwrap_err()
+        .to_string()
+        .contains("recursion limit reached"));
+}
+
+/// Test the various ways in which `store_set` sets the `id` of entities and
+/// errors when there are issues
+#[tokio::test]
+async fn test_store_set_id() {
+    struct Host {
+        ctx: MappingContext<Chain>,
+        host_exports: host_exports::test_support::HostExports<Chain>,
+        stopwatch: StopwatchMetrics,
+        gas: GasCounter,
+    }
+
+    impl Host {
+        async fn new() -> Host {
+            let version = ENV_VARS.mappings.max_api_version.clone();
+            let wasm_file = wasm_file_path("boolean.wasm", API_VERSION_0_0_5);
+
+            let ds = mock_data_source(&wasm_file, version.clone());
+
+            let store = STORE.clone();
+            let deployment = DeploymentHash::new("hostStoreSetId".to_string()).unwrap();
+            let deployment = test_store::create_test_subgraph(
+                &deployment,
+                "type User @entity {
+                    id: ID!,
+                    name: String,
+                }
+
+                type Binary @entity {
+                    id: Bytes!
+                }",
+            )
+            .await;
+
+            let ctx = mock_context(deployment.clone(), ds, store.subgraph_store(), version);
+            let host_exports = host_exports::test_support::HostExports::new(&ctx);
+
+            let metrics_registry = Arc::new(MetricsRegistry::mock());
+            let stopwatch = StopwatchMetrics::new(
+                ctx.logger.clone(),
+                deployment.hash.clone(),
+                "test",
+                metrics_registry.clone(),
+            );
+            let gas = GasCounter::new();
+
+            Host {
+                ctx,
+                host_exports,
+                stopwatch,
+                gas,
+            }
+        }
+
+        fn store_set(
+            &mut self,
+            entity_type: &str,
+            id: &str,
+            data: Vec<(&str, &str)>,
+        ) -> Result<(), HostExportError> {
+            let data: Vec<_> = data.into_iter().map(|(k, v)| (k, Value::from(v))).collect();
+            self.store_setv(entity_type, id, data)
+        }
+
+        fn store_setv(
+            &mut self,
+            entity_type: &str,
+            id: &str,
+            data: Vec<(&str, Value)>,
+        ) -> Result<(), HostExportError> {
+            let id = String::from(id);
+            let data = HashMap::from_iter(data.into_iter().map(|(k, v)| (Word::from(k), v)));
+            self.host_exports.store_set(
+                &self.ctx.logger,
+                &mut self.ctx.state,
+                &self.ctx.proof_of_indexing,
+                entity_type.to_string(),
+                id,
+                data,
+                &self.stopwatch,
+                &self.gas,
+            )
+        }
+
+        fn store_get(
+            &mut self,
+            entity_type: &str,
+            id: &str,
+        ) -> Result<Option<Entity>, anyhow::Error> {
+            let user_id = String::from(id);
+            self.host_exports.store_get(
+                &mut self.ctx.state,
+                entity_type.to_string(),
+                user_id,
+                &self.gas,
+            )
+        }
+    }
+
+    #[track_caller]
+    fn err_says<E: std::fmt::Debug + std::fmt::Display>(err: E, exp: &str) {
+        let err = err.to_string();
+        assert!(err.contains(exp), "expected `{err}` to contain `{exp}`");
+    }
+
+    const UID: &str = "u1";
+    const USER: &str = "User";
+    const BID: &str = "0xdeadbeef";
+    const BINARY: &str = "Binary";
+
+    let mut host = Host::new().await;
+
+    host.store_set(USER, UID, vec![("id", "u1"), ("name", "user1")])
+        .expect("setting with same id works");
+
+    let err = host
+        .store_set(USER, UID, vec![("id", "ux"), ("name", "user1")])
+        .expect_err("setting with different id fails");
+    err_says(err, "conflicts with ID passed");
+
+    host.store_set(USER, UID, vec![("name", "user2")])
+        .expect("setting with no id works");
+
+    let entity = host.store_get(USER, UID).unwrap().unwrap();
+    assert_eq!(
+        "u1",
+        entity.id().as_str(),
+        "store.set sets id automatically"
+    );
+
+    let beef = Value::Bytes("0xbeef".parse().unwrap());
+    let err = host
+        .store_setv(USER, "0xbeef", vec![("id", beef)])
+        .expect_err("setting with Bytes id fails");
+    err_says(err, "must have type ID! but has type Bytes");
+
+    host.store_setv(USER, UID, vec![("id", Value::Int(32))])
+        .expect_err("id must be a string");
+
+    //
+    // Now for bytes id
+    //
+    let bid_bytes = Value::Bytes(BID.parse().unwrap());
+
+    let err = host
+        .store_set(BINARY, BID, vec![("id", BID), ("name", "user1")])
+        .expect_err("setting with string id in values fails");
+    err_says(err, "must have type Bytes! but has type String");
+
+    host.store_setv(
+        BINARY,
+        BID,
+        vec![("id", bid_bytes), ("name", Value::from("user1"))],
+    )
+    .expect("setting with bytes id in values works");
+
+    let beef = Value::Bytes("0xbeef".parse().unwrap());
+    let err = host
+        .store_setv(BINARY, BID, vec![("id", beef)])
+        .expect_err("setting with different id fails");
+    err_says(err, "conflicts with ID passed");
+
+    host.store_set(BINARY, BID, vec![("name", "user2")])
+        .expect("setting with no id works");
+
+    let entity = host.store_get(BINARY, BID).unwrap().unwrap();
+    assert_eq!(BID, entity.id().as_str(), "store.set sets id automatically");
+
+    let err = host
+        .store_setv(BINARY, BID, vec![("id", Value::Int(32))])
+        .expect_err("id must be Bytes");
+    err_says(err, "Entity has non-string `id` attribute");
 }

@@ -1,5 +1,7 @@
 use super::{BlockNumber, DeploymentHash, DeploymentSchemaVersion};
 use crate::prelude::QueryExecutionError;
+use crate::util::intern::Error as InternError;
+
 use anyhow::{anyhow, Error};
 use diesel::result::Error as DieselError;
 use thiserror::Error;
@@ -18,6 +20,8 @@ pub enum StoreError {
     UnknownField(String),
     #[error("unknown table '{0}'")]
     UnknownTable(String),
+    #[error("entity type '{0}' does not have an attribute '{0}'")]
+    UnknownAttribute(String, String),
     #[error("malformed directive '{0}'")]
     MalformedDirective(String),
     #[error("query execution failed: {0}")]
@@ -118,5 +122,13 @@ impl From<QueryExecutionError> for StoreError {
 impl From<std::fmt::Error> for StoreError {
     fn from(e: std::fmt::Error) -> Self {
         StoreError::Unknown(anyhow!("{}", e.to_string()))
+    }
+}
+
+impl From<InternError> for StoreError {
+    fn from(e: InternError) -> Self {
+        match e {
+            InternError::NotInterned(key) => StoreError::UnknownField(key),
+        }
     }
 }
