@@ -1,6 +1,7 @@
 mod entity_cache;
 mod err;
 mod traits;
+pub mod write;
 
 pub use entity_cache::{EntityCache, GetScope, ModificationsAndCache};
 
@@ -9,12 +10,13 @@ pub use err::StoreError;
 use itertools::Itertools;
 use strum_macros::Display;
 pub use traits::*;
+pub use write::Batch;
 
 use futures::stream::poll_fn;
 use futures::{Async, Poll, Stream};
 use graphql_parser::schema as s;
 use serde::{Deserialize, Serialize};
-use std::borrow::Borrow;
+use std::borrow::{Borrow, Cow};
 use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt::Display;
@@ -34,7 +36,7 @@ use crate::{constraint_violation, prelude::*};
 
 /// The type name of an entity. This is the string that is used in the
 /// subgraph's GraphQL schema as `type NAME @entity { .. }`
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct EntityType(Word);
 
 impl EntityType {
@@ -109,6 +111,11 @@ impl ToSql<diesel::sql_types::Text, diesel::pg::Pg> for EntityType {
     }
 }
 
+impl std::fmt::Debug for EntityType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "EntityType({})", self.0)
+    }
+}
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct EntityFilterDerivative(bool);
 
@@ -124,7 +131,7 @@ impl EntityFilterDerivative {
 
 /// Key by which an individual entity in the store can be accessed. Stores
 /// only the entity type and id. The deployment must be known from context.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct EntityKey {
     /// Name of the entity type.
     pub entity_type: EntityType,
@@ -146,6 +153,15 @@ impl EntityKey {
     }
 }
 
+impl std::fmt::Debug for EntityKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "EntityKey({}[{}], cr={})",
+            self.entity_type, self.entity_id, self.causality_region
+        )
+    }
+}
 #[derive(Debug, Clone)]
 pub struct LoadRelatedRequest {
     /// Name of the entity type.
@@ -689,10 +705,14 @@ pub struct StoreEvent {
 
 impl StoreEvent {
     pub fn new(changes: Vec<EntityChange>) -> StoreEvent {
+        let changes = changes.into_iter().collect();
+        StoreEvent::from_set(changes)
+    }
+
+    fn from_set(changes: HashSet<EntityChange>) -> StoreEvent {
         static NEXT_TAG: AtomicUsize = AtomicUsize::new(0);
 
         let tag = NEXT_TAG.fetch_add(1, Ordering::Relaxed);
-        let changes = changes.into_iter().collect();
         StoreEvent { tag, changes }
     }
 
@@ -712,6 +732,19 @@ impl StoreEvent {
             })
             .collect();
         StoreEvent::new(changes)
+    }
+
+    pub fn from_types(deployment: &DeploymentHash, entity_types: HashSet<EntityType>) -> Self {
+        let changes =
+            HashSet::from_iter(
+                entity_types
+                    .into_iter()
+                    .map(|entity_type| EntityChange::Data {
+                        subgraph_id: deployment.clone(),
+                        entity_type,
+                    }),
+            );
+        Self::from_set(changes)
     }
 
     /// Extend `ev1` with `ev2`. If `ev1` is `None`, just set it to `ev2`
@@ -1015,16 +1048,14 @@ enum EntityOp {
 }
 
 impl EntityOp {
-    fn apply_to(self, entity: Option<Entity>) -> Result<Option<Entity>, InternError> {
+    fn apply_to(self, entity: &mut Option<Cow<Entity>>) -> Result<(), InternError> {
         use EntityOp::*;
         match (self, entity) {
-            (Remove, _) => Ok(None),
-            (Overwrite(new), _) | (Update(new), None) => Ok(Some(new)),
-            (Update(updates), Some(mut entity)) => {
-                entity.merge_remove_null_fields(updates)?;
-                Ok(Some(entity))
-            }
+            (Remove, e @ _) => *e = None,
+            (Overwrite(new), e @ _) | (Update(new), e @ None) => *e = Some(Cow::Owned(new)),
+            (Update(updates), Some(entity)) => entity.to_mut().merge_remove_null_fields(updates)?,
         }
+        Ok(())
     }
 
     fn accumulate(&mut self, next: EntityOp) {

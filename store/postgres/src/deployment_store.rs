@@ -5,13 +5,15 @@ use diesel::prelude::*;
 use diesel::r2d2::{ConnectionManager, PooledConnection};
 use graph::anyhow::Context;
 use graph::blockchain::block_stream::FirehoseCursor;
+use graph::components::store::write::RowGroup;
 use graph::components::store::{
-    DerivedEntityQuery, EntityKey, EntityType, PrunePhase, PruneReporter, PruneRequest,
+    Batch, DerivedEntityQuery, EntityKey, EntityType, PrunePhase, PruneReporter, PruneRequest,
     PruningStrategy, StoredDynamicDataSource, VersionStats,
 };
 use graph::components::versions::VERSIONS;
 use graph::data::query::Trace;
 use graph::data::subgraph::{status, SPEC_VERSION_0_0_6};
+use graph::data::value::Word;
 use graph::data_source::CausalityRegion;
 use graph::prelude::futures03::FutureExt;
 use graph::prelude::{
@@ -23,7 +25,6 @@ use graph::tokio::task::JoinHandle;
 use itertools::Itertools;
 use lru_time_cache::LruCache;
 use rand::{seq::SliceRandom, thread_rng};
-use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::convert::Into;
 use std::iter::FromIterator;
@@ -39,13 +40,13 @@ use graph::constraint_violation;
 use graph::data::subgraph::schema::{DeploymentCreate, SubgraphError, POI_DIGEST, POI_OBJECT};
 use graph::prelude::{
     anyhow, debug, info, o, warn, web3, AttributeNames, BlockNumber, BlockPtr, CheapClone,
-    DeploymentHash, DeploymentState, Entity, EntityModification, EntityQuery, Error, Logger,
-    QueryExecutionError, StopwatchMetrics, StoreError, StoreEvent, UnfailOutcome, Value, ENV_VARS,
+    DeploymentHash, DeploymentState, Entity, EntityQuery, Error, Logger, QueryExecutionError,
+    StopwatchMetrics, StoreError, StoreEvent, UnfailOutcome, Value, ENV_VARS,
 };
 use graph::schema::{ApiSchema, InputSchema};
 use web3::types::Address;
 
-use crate::block_range::{block_number, BLOCK_COLUMN, BLOCK_RANGE_COLUMN};
+use crate::block_range::{BLOCK_COLUMN, BLOCK_RANGE_COLUMN};
 use crate::deployment::{self, OnSync};
 use crate::detail::ErrorDetail;
 use crate::dynds::DataSourcesTable;
@@ -272,7 +273,8 @@ impl DeploymentStore {
         &self,
         conn: &PgConnection,
         layout: &Layout,
-        key: &EntityKey,
+        entity_type: &EntityType,
+        entity_id: &Word,
     ) -> Result<(), StoreError> {
         // Collect all types that share an interface implementation with this
         // entity type, and make sure there are no conflicting IDs.
@@ -291,24 +293,24 @@ impl DeploymentStore {
             .expect("API schema should be present")
             .clone();
         let types_for_interface = schema.types_for_interface();
-        let entity_type = key.entity_type.to_string();
+        let entity_type_str = entity_type.to_string();
         let types_with_shared_interface = Vec::from_iter(
             schema
-                .interfaces_for_type(&key.entity_type)
+                .interfaces_for_type(entity_type)
                 .into_iter()
                 .flatten()
                 .flat_map(|interface| &types_for_interface[&EntityType::from(interface)])
                 .map(EntityType::from)
-                .filter(|type_name| type_name != &key.entity_type),
+                .filter(|type_name| type_name != entity_type),
         );
 
         if !types_with_shared_interface.is_empty() {
             if let Some(conflicting_entity) =
-                layout.conflicting_entity(conn, &key.entity_id, types_with_shared_interface)?
+                layout.conflicting_entity(conn, entity_id, types_with_shared_interface)?
             {
                 return Err(StoreError::ConflictingId(
-                    entity_type,
-                    key.entity_id.to_string(),
+                    entity_type_str,
+                    entity_id.to_string(),
                     conflicting_entity,
                 ));
             }
@@ -316,123 +318,42 @@ impl DeploymentStore {
         Ok(())
     }
 
-    fn apply_entity_modifications(
+    fn apply_entity_modifications<'a>(
         &self,
         conn: &PgConnection,
         layout: &Layout,
-        mods: &[EntityModification],
-        ptr: &BlockPtr,
+        groups: impl Iterator<Item = &'a RowGroup>,
         stopwatch: &StopwatchMetrics,
     ) -> Result<i32, StoreError> {
-        use EntityModification::*;
         let mut count = 0;
 
-        // Group `Insert`s and `Overwrite`s by key, and accumulate `Remove`s.
-        let mut inserts = HashMap::new();
-        let mut overwrites = HashMap::new();
-        let mut removals = HashMap::new();
-        for modification in mods.iter() {
-            match modification {
-                Insert { key, data } => {
-                    inserts
-                        .entry(key.entity_type.clone())
-                        .or_insert_with(Vec::new)
-                        .push((key, Cow::from(data)));
-                }
-                Overwrite { key, data } => {
-                    overwrites
-                        .entry(key.entity_type.clone())
-                        .or_insert_with(Vec::new)
-                        .push((key, Cow::from(data)));
-                }
-                Remove { key } => {
-                    removals
-                        .entry(key.entity_type.clone())
-                        .or_insert_with(Vec::new)
-                        .push(key.entity_id.as_str());
-                }
+        for group in groups {
+            count += group.entity_count_change();
+
+            // Clamp entities before inserting them to avoid having versions
+            // with overlapping block ranges
+            let section = stopwatch.start_section("apply_entity_modifications_delete");
+            layout.delete(conn, group, stopwatch)?;
+            section.end();
+
+            let section = stopwatch.start_section("check_interface_entity_uniqueness");
+            for row in group.writes().filter(|emod| emod.creates_entity()) {
+                // WARNING: This will potentially execute 2 queries for each entity key.
+                self.check_interface_entity_uniqueness(
+                    conn,
+                    layout,
+                    &group.entity_type,
+                    &row.id(),
+                )?;
             }
+            section.end();
+
+            let section = stopwatch.start_section("apply_entity_modifications_insert");
+            layout.insert(conn, group, stopwatch)?;
+            section.end();
         }
 
-        // Apply modification groups.
-        // Inserts:
-        for (entity_type, mut entities) in inserts.into_iter() {
-            count +=
-                self.insert_entities(&entity_type, &mut entities, conn, layout, ptr, stopwatch)?
-                    as i32
-        }
-
-        // Overwrites:
-        for (entity_type, mut entities) in overwrites.into_iter() {
-            // we do not update the count since the number of entities remains the same
-            self.overwrite_entities(&entity_type, &mut entities, conn, layout, ptr, stopwatch)?;
-        }
-
-        // Removals
-        for (entity_type, entity_keys) in removals.into_iter() {
-            count -= self.remove_entities(
-                &entity_type,
-                entity_keys.as_slice(),
-                conn,
-                layout,
-                ptr,
-                stopwatch,
-            )? as i32;
-        }
         Ok(count)
-    }
-
-    fn insert_entities<'a>(
-        &'a self,
-        entity_type: &'a EntityType,
-        data: &'a mut [(&'a EntityKey, Cow<'a, Entity>)],
-        conn: &PgConnection,
-        layout: &'a Layout,
-        ptr: &BlockPtr,
-        stopwatch: &StopwatchMetrics,
-    ) -> Result<usize, StoreError> {
-        let section = stopwatch.start_section("check_interface_entity_uniqueness");
-        for (key, _) in data.iter() {
-            // WARNING: This will potentially execute 2 queries for each entity key.
-            self.check_interface_entity_uniqueness(conn, layout, key)?;
-        }
-        section.end();
-
-        let _section = stopwatch.start_section("apply_entity_modifications_insert");
-        layout.insert(conn, entity_type, data, block_number(ptr), stopwatch)
-    }
-
-    fn overwrite_entities<'a>(
-        &'a self,
-        entity_type: &'a EntityType,
-        data: &'a mut [(&'a EntityKey, Cow<'a, Entity>)],
-        conn: &PgConnection,
-        layout: &'a Layout,
-        ptr: &BlockPtr,
-        stopwatch: &StopwatchMetrics,
-    ) -> Result<usize, StoreError> {
-        let section = stopwatch.start_section("check_interface_entity_uniqueness");
-        for (key, _) in data.iter() {
-            // WARNING: This will potentially execute 2 queries for each entity key.
-            self.check_interface_entity_uniqueness(conn, layout, key)?;
-        }
-        section.end();
-
-        let _section = stopwatch.start_section("apply_entity_modifications_update");
-        layout.update(conn, entity_type, data, block_number(ptr), stopwatch)
-    }
-
-    fn remove_entities(
-        &self,
-        entity_type: &EntityType,
-        entity_keys: &[&str],
-        conn: &PgConnection,
-        layout: &Layout,
-        ptr: &BlockPtr,
-        stopwatch: &StopwatchMetrics,
-    ) -> Result<usize, StoreError> {
-        let _section = stopwatch.start_section("apply_entity_modifications_delete");
-        layout.delete(conn, entity_type, entity_keys, block_number(ptr), stopwatch)
     }
 
     /// Execute a closure with a connection to the database.
@@ -1155,14 +1076,9 @@ impl DeploymentStore {
         self: &Arc<Self>,
         logger: &Logger,
         site: Arc<Site>,
-        block_ptr_to: &BlockPtr,
-        firehose_cursor: &FirehoseCursor,
-        mods: &[EntityModification],
+        batch: &Batch,
         stopwatch: &StopwatchMetrics,
-        data_sources: &[StoredDynamicDataSource],
-        deterministic_errors: &[SubgraphError],
         manifest_idx_and_name: &[(u32, String)],
-        processed_data_sources: &[StoredDynamicDataSource],
     ) -> Result<StoreEvent, StoreError> {
         let conn = {
             let _section = stopwatch.start_section("transact_blocks_get_conn");
@@ -1173,7 +1089,7 @@ impl DeploymentStore {
         // wait with sending it until we have done all our other work
         // so that we do not hold a lock on the notification queue
         // for longer than we have to
-        let event: StoreEvent = StoreEvent::from_mods(&site.deployment, mods);
+        let event: StoreEvent = batch.store_event(&site.deployment);
 
         let (layout, earliest_block) = deployment::with_lock(&conn, &site, || {
             conn.transaction(|| -> Result<_, StoreError> {
@@ -1184,39 +1100,37 @@ impl DeploymentStore {
                 let count = self.apply_entity_modifications(
                     &conn,
                     layout.as_ref(),
-                    mods,
-                    block_ptr_to,
+                    batch.groups(),
                     stopwatch,
                 )?;
                 section.end();
 
-                dynds::insert(
-                    &conn,
-                    &site,
-                    data_sources,
-                    block_ptr_to,
-                    manifest_idx_and_name,
-                )?;
+                dynds::insert(&conn, &site, &batch.data_sources, manifest_idx_and_name)?;
 
-                dynds::update_offchain_status(&conn, &site, processed_data_sources)?;
+                dynds::update_offchain_status(&conn, &site, &batch.offchain_to_remove)?;
 
-                if !deterministic_errors.is_empty() {
+                if !batch.deterministic_errors.is_empty() {
                     deployment::insert_subgraph_errors(
                         &conn,
                         &site.deployment,
-                        deterministic_errors,
-                        block_ptr_to.block_number(),
+                        &batch.deterministic_errors,
+                        batch.block_ptr.number,
                     )?;
                 }
 
-                let earliest_block =
-                    deployment::transact_block(&conn, &site, block_ptr_to, firehose_cursor, count)?;
+                let earliest_block = deployment::transact_block(
+                    &conn,
+                    &site,
+                    &batch.block_ptr,
+                    &batch.firehose_cursor,
+                    count,
+                )?;
 
                 Ok((layout, earliest_block))
             })
         })?;
 
-        if block_ptr_to.number as f64
+        if batch.block_ptr.number as f64
             > earliest_block as f64
                 + layout.history_blocks as f64 * ENV_VARS.store.history_slack_factor
         {
@@ -1229,7 +1143,7 @@ impl DeploymentStore {
                 site,
                 layout.history_blocks,
                 earliest_block,
-                block_ptr_to.number,
+                batch.block_ptr.number,
             )?;
         }
 
@@ -1315,12 +1229,13 @@ impl DeploymentStore {
         Ok(())
     }
 
-    fn rewind_with_conn(
+    fn rewind_or_truncate_with_conn(
         &self,
         conn: &PgConnection,
         site: Arc<Site>,
         block_ptr_to: BlockPtr,
         firehose_cursor: &FirehoseCursor,
+        truncate: bool,
     ) -> Result<StoreEvent, StoreError> {
         let event = deployment::with_lock(conn, &site, || {
             conn.transaction(|| -> Result<_, StoreError> {
@@ -1353,7 +1268,15 @@ impl DeploymentStore {
                 // Revert the data
                 let layout = self.layout(conn, site.clone())?;
 
-                let (event, count) = layout.revert_block(conn, block)?;
+                let event = if truncate {
+                    let event = layout.truncate_tables(conn)?;
+                    deployment::set_entity_count(conn, site.as_ref(), layout.count_query.as_str())?;
+                    event
+                } else {
+                    let (event, count) = layout.revert_block(conn, block)?;
+                    deployment::update_entity_count(conn, site.as_ref(), count)?;
+                    event
+                };
 
                 // Revert the meta data changes that correspond to this subgraph.
                 // Only certain meta data changes need to be reverted, most
@@ -1362,12 +1285,35 @@ impl DeploymentStore {
                 // changes that might need to be reverted
                 Layout::revert_metadata(conn, &site, block)?;
 
-                deployment::update_entity_count(conn, site.as_ref(), count)?;
                 Ok(event)
             })
         })?;
 
         Ok(event)
+    }
+
+    pub(crate) fn truncate(
+        &self,
+        site: Arc<Site>,
+        block_ptr_to: BlockPtr,
+    ) -> Result<StoreEvent, StoreError> {
+        let conn = self.get_conn()?;
+
+        // Unwrap: If we are reverting then the block ptr is not `None`.
+        let block_ptr_from = Self::block_ptr_with_conn(&conn, site.cheap_clone())?.unwrap();
+
+        // Sanity check on block numbers
+        if block_ptr_from.number <= block_ptr_to.number {
+            constraint_violation!(
+                "truncate must go backwards, but would go from block {} to block {}",
+                block_ptr_from.number,
+                block_ptr_to.number
+            );
+        }
+
+        // When rewinding, we reset the firehose cursor. That way, on resume, Firehose will start
+        // from the block_ptr instead (with sanity check to ensure it's resume at the exact block).
+        self.rewind_or_truncate_with_conn(&conn, site, block_ptr_to, &FirehoseCursor::None, true)
     }
 
     pub(crate) fn rewind(
@@ -1391,7 +1337,7 @@ impl DeploymentStore {
 
         // When rewinding, we reset the firehose cursor. That way, on resume, Firehose will start
         // from the block_ptr instead (with sanity check to ensure it's resume at the exact block).
-        self.rewind_with_conn(&conn, site, block_ptr_to, &FirehoseCursor::None)
+        self.rewind_or_truncate_with_conn(&conn, site, block_ptr_to, &FirehoseCursor::None, false)
     }
 
     pub(crate) fn revert_block_operations(
@@ -1409,7 +1355,7 @@ impl DeploymentStore {
             panic!("revert_block_operations must revert only backward, you are trying to revert forward going from subgraph block {} to new block {}", deployment_head, block_ptr_to);
         }
 
-        self.rewind_with_conn(&conn, site, block_ptr_to, firehose_cursor)
+        self.rewind_or_truncate_with_conn(&conn, site, block_ptr_to, firehose_cursor, false)
     }
 
     pub(crate) async fn deployment_state_from_id(

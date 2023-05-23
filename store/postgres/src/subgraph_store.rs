@@ -950,6 +950,12 @@ impl SubgraphStoreInner {
         self.send_store_event(&event)
     }
 
+    pub fn truncate(&self, id: DeploymentHash, block_ptr_to: BlockPtr) -> Result<(), StoreError> {
+        let (store, site) = self.store(&id)?;
+        let event = store.truncate(site, block_ptr_to)?;
+        self.send_store_event(&event)
+    }
+
     pub(crate) async fn get_proof_of_indexing(
         &self,
         id: &DeploymentHash,
@@ -1154,6 +1160,15 @@ impl SubgraphStoreInner {
         let src_store = self.for_site(site)?;
         src_store.load_deployment(site)
     }
+
+    pub fn load_deployment_by_id(
+        &self,
+        id: DeploymentId,
+    ) -> Result<SubgraphDeploymentEntity, StoreError> {
+        let site = self.find_site(id)?;
+        let src_store = self.for_site(&site)?;
+        src_store.load_deployment(&site)
+    }
 }
 
 const STATE_ENS_NOT_CHECKED: u8 = 0;
@@ -1332,6 +1347,7 @@ impl SubgraphStoreTrait for SubgraphStore {
         self: Arc<Self>,
         logger: Logger,
         deployment: graph::components::store::DeploymentId,
+        manifest_idx_and_name: Arc<Vec<(u32, String)>>,
     ) -> Result<Arc<dyn store::WritableStore>, StoreError> {
         let deployment = deployment.into();
         // We cache writables to make sure calls to this method are
@@ -1355,7 +1371,14 @@ impl SubgraphStoreTrait for SubgraphStore {
         .unwrap()?; // Propagate panics, there shouldn't be any.
 
         let writable = Arc::new(
-            WritableStore::new(self.as_ref().clone(), logger, site, self.registry.clone()).await?,
+            WritableStore::new(
+                self.as_ref().clone(),
+                logger,
+                site,
+                manifest_idx_and_name,
+                self.registry.clone(),
+            )
+            .await?,
         );
         self.writables
             .lock()

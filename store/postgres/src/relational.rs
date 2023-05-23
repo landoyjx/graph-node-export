@@ -24,6 +24,7 @@ use diesel::types::{FromSql, ToSql};
 use diesel::{connection::SimpleConnection, Connection};
 use diesel::{debug_query, OptionalExtension, PgConnection, RunQueryDsl};
 use graph::cheap_clone::CheapClone;
+use graph::components::store::write::RowGroup;
 use graph::constraint_violation;
 use graph::data::graphql::TypeExt as _;
 use graph::data::query::Trace;
@@ -33,8 +34,9 @@ use graph::prelude::{q, s, EntityQuery, StopwatchMetrics, ENV_VARS};
 use graph::schema::{FulltextConfig, FulltextDefinition, InputSchema, SCHEMA_TYPE_NAME};
 use graph::slog::warn;
 use inflector::Inflector;
+use itertools::Itertools;
 use lazy_static::lazy_static;
-use std::borrow::{Borrow, Cow};
+use std::borrow::Borrow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::convert::{From, TryFrom};
 use std::fmt::{self, Write};
@@ -436,7 +438,8 @@ impl Layout {
         schema: &InputSchema,
         entities_with_causality_region: BTreeSet<EntityType>,
     ) -> Result<Layout, StoreError> {
-        let catalog = Catalog::for_creation(site.cheap_clone(), entities_with_causality_region);
+        let catalog =
+            Catalog::for_creation(conn, site.cheap_clone(), entities_with_causality_region)?;
         let layout = Self::new(site, schema, catalog)?;
         let sql = layout
             .as_ddl()
@@ -651,24 +654,22 @@ impl Layout {
     pub fn insert<'a>(
         &'a self,
         conn: &PgConnection,
-        entity_type: &'a EntityType,
-        entities: &'a mut [(&'a EntityKey, Cow<'a, Entity>)],
-        block: BlockNumber,
+        group: &'a RowGroup,
         stopwatch: &StopwatchMetrics,
-    ) -> Result<usize, StoreError> {
-        let table = self.table_for_entity(entity_type)?;
+    ) -> Result<(), StoreError> {
+        let table = self.table_for_entity(&group.entity_type)?;
         let _section = stopwatch.start_section("insert_modification_insert_query");
-        let mut count = 0;
 
         // We insert the entities in chunks to make sure each operation does
         // not exceed the maximum number of bindings allowed in queries
         let chunk_size = InsertQuery::chunk_size(table);
-        for chunk in entities.chunks_mut(chunk_size) {
-            count += InsertQuery::new(table, chunk, block)?
-                .get_results(conn)
-                .map(|ids| ids.len())?
+        for chunk in group.write_chunks(chunk_size) {
+            // Empty chunks would lead to invalid SQL
+            if !chunk.is_empty() {
+                InsertQuery::new(table, &chunk)?.execute(conn)?;
+            }
         }
-        Ok(count)
+        Ok(())
     }
 
     pub fn conflicting_entity(
@@ -799,32 +800,25 @@ impl Layout {
     pub fn update<'a>(
         &'a self,
         conn: &PgConnection,
-        entity_type: &'a EntityType,
-        entities: &'a mut [(&'a EntityKey, Cow<'a, Entity>)],
-        block: BlockNumber,
+        group: &'a RowGroup,
         stopwatch: &StopwatchMetrics,
     ) -> Result<usize, StoreError> {
-        let table = self.table_for_entity(entity_type)?;
-        if table.immutable {
-            let ids = entities
-                .iter_mut()
-                .map(|(key, _)| key.entity_id.as_str())
-                .collect::<Vec<_>>()
-                .join(", ");
+        let table = self.table_for_entity(&group.entity_type)?;
+        if table.immutable && group.has_clamps() {
+            let ids = group.ids().collect::<Vec<_>>().join(", ");
             return Err(constraint_violation!(
                 "entities of type `{}` can not be updated since they are immutable. Entity ids are [{}]",
-                entity_type,
+                group.entity_type,
                 ids
             ));
         }
 
-        let entity_keys: Vec<&str> = entities
-            .iter()
-            .map(|(key, _)| key.entity_id.as_str())
-            .collect();
-
         let section = stopwatch.start_section("update_modification_clamp_range_query");
-        ClampRangeQuery::new(table, &entity_keys, block)?.execute(conn)?;
+        for (block, rows) in group.clamps_by_block() {
+            let entity_keys: Vec<&str> = rows.iter().map(|row| row.id().as_str()).collect();
+
+            ClampRangeQuery::new(table, &entity_keys, block)?.execute(conn)?;
+        }
         section.end();
 
         let _section = stopwatch.start_section("update_modification_insert_query");
@@ -833,34 +827,48 @@ impl Layout {
         // We insert the entities in chunks to make sure each operation does
         // not exceed the maximum number of bindings allowed in queries
         let chunk_size = InsertQuery::chunk_size(table);
-        for chunk in entities.chunks_mut(chunk_size) {
-            count += InsertQuery::new(table, chunk, block)?.execute(conn)?;
+        for chunk in group.write_chunks(chunk_size) {
+            count += InsertQuery::new(table, &chunk)?.execute(conn)?;
         }
+
         Ok(count)
     }
 
     pub fn delete(
         &self,
         conn: &PgConnection,
-        entity_type: &EntityType,
-        entity_ids: &[&str],
-        block: BlockNumber,
+        group: &RowGroup,
         stopwatch: &StopwatchMetrics,
     ) -> Result<usize, StoreError> {
-        let table = self.table_for_entity(entity_type)?;
+        if !group.has_clamps() {
+            // Nothing to do
+            return Ok(0);
+        }
+
+        let table = self.table_for_entity(&group.entity_type)?;
         if table.immutable {
             return Err(constraint_violation!(
                 "entities of type `{}` can not be deleted since they are immutable. Entity ids are [{}]",
-                entity_type, entity_ids.join(", ")
+                table.object, group.ids().join(", ")
             ));
         }
 
         let _section = stopwatch.start_section("delete_modification_clamp_range_query");
         let mut count = 0;
-        for chunk in entity_ids.chunks(DELETE_OPERATION_CHUNK_SIZE) {
-            count += ClampRangeQuery::new(table, chunk, block)?.execute(conn)?
+        for (block, rows) in group.clamps_by_block() {
+            let ids: Vec<_> = rows.iter().map(|eref| eref.id().as_str()).collect();
+            for chunk in ids.chunks(DELETE_OPERATION_CHUNK_SIZE) {
+                count += ClampRangeQuery::new(table, chunk, block)?.execute(conn)?
+            }
         }
         Ok(count)
+    }
+
+    pub fn truncate_tables(&self, conn: &PgConnection) -> Result<StoreEvent, StoreError> {
+        for table in self.tables.values() {
+            conn.execute(&format!("TRUNCATE TABLE {}", table.qualified_name))?;
+        }
+        Ok(StoreEvent::new(vec![]))
     }
 
     /// Revert the block with number `block` and all blocks with higher

@@ -188,6 +188,8 @@ pub enum Value {
     BigInt(scalar::BigInt),
 }
 
+pub const NULL: Value = Value::Null;
+
 impl stable_hash_legacy::StableHash for Value {
     fn stable_hash<H: stable_hash_legacy::StableHasher>(
         &self,
@@ -602,7 +604,7 @@ lazy_static! {
 }
 
 /// An entity is represented as a map of attribute names to values.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, PartialEq, Eq, Serialize)]
 pub struct Entity(Object<Value>);
 
 pub trait IntoEntityIterator: IntoIterator<Item = (Word, Value)> {}
@@ -687,6 +689,12 @@ impl Entity {
     // This collects the entity into an ordered vector so that it can be iterated deterministically.
     pub fn sorted(self) -> Vec<(Word, Value)> {
         let mut v: Vec<_> = self.0.into_iter().map(|(k, v)| (k, v)).collect();
+        v.sort_by(|(k1, _), (k2, _)| k1.cmp(k2));
+        v
+    }
+
+    pub fn sorted_ref(&self) -> Vec<(&str, &Value)> {
+        let mut v: Vec<_> = self.0.iter().collect();
         v.sort_by(|(k1, _), (k2, _)| k1.cmp(k2));
         v
     }
@@ -920,6 +928,16 @@ impl CacheWeight for Entity {
 impl GasSizeOf for Entity {
     fn gas_size_of(&self) -> Gas {
         self.0.gas_size_of()
+    }
+}
+
+impl std::fmt::Debug for Entity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut ds = f.debug_struct("Entity");
+        for (k, v) in &self.0 {
+            ds.field(k, v);
+        }
+        ds.finish()
     }
 }
 

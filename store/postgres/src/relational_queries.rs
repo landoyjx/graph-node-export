@@ -9,10 +9,12 @@ use diesel::pg::{Pg, PgConnection};
 use diesel::query_builder::{AstPass, QueryFragment, QueryId};
 use diesel::query_dsl::{LoadQuery, RunQueryDsl};
 use diesel::result::{Error as DieselError, QueryResult};
-use diesel::sql_types::{Array, BigInt, Binary, Bool, Integer, Jsonb, Text};
+use diesel::sql_types::{Array, BigInt, Binary, Bool, Integer, Jsonb, Range, Text};
 use diesel::Connection;
 
+use graph::components::store::write::WriteChunk;
 use graph::components::store::{DerivedEntityQuery, EntityKey};
+use graph::data::store::NULL;
 use graph::data::value::{Object, Word};
 use graph::data_source::CausalityRegion;
 use graph::prelude::{
@@ -26,13 +28,13 @@ use graph::{
     data::store::scalar,
 };
 use itertools::Itertools;
-use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::convert::TryFrom;
 use std::fmt::{self, Display};
 use std::iter::FromIterator;
 use std::str::FromStr;
 
+use crate::block_range::BlockRange;
 use crate::relational::{
     Column, ColumnType, IdType, Layout, SqlName, Table, BYTE_ARRAY_PREFIX_SIZE, PRIMARY_KEY_COLUMN,
     STRING_PREFIX_SIZE,
@@ -1748,70 +1750,98 @@ impl<'a> LoadQuery<PgConnection, EntityData> for FindDerivedQuery<'a> {
 impl<'a, Conn> RunQueryDsl<Conn> for FindDerivedQuery<'a> {}
 
 #[derive(Debug)]
-pub struct InsertQuery<'a> {
-    table: &'a Table,
-    entities: &'a [(&'a EntityKey, Cow<'a, Entity>)],
-    unique_columns: Vec<&'a Column>,
-    br_column: BlockRangeColumn<'a>,
-}
+struct FulltextValues<'a>(HashMap<&'a Word, Vec<(&'a str, Value)>>);
 
-impl<'a> InsertQuery<'a> {
-    pub fn new(
-        table: &'a Table,
-        entities: &'a mut [(&'a EntityKey, Cow<Entity>)],
-        block: BlockNumber,
-    ) -> Result<InsertQuery<'a>, StoreError> {
-        for (entity_key, entity) in entities.iter_mut() {
-            let mut fulltext = Vec::new();
-            for column in table.columns.iter() {
+impl<'a> FulltextValues<'a> {
+    fn new(table: &'a Table, rows: &'a WriteChunk<'a>) -> Self {
+        let mut map = HashMap::new();
+        for column in table.columns.iter().filter(|column| column.is_fulltext()) {
+            for row in rows {
+                let mut fulltext = Vec::new();
                 if let Some(fields) = column.fulltext_fields.as_ref() {
                     let fulltext_field_values = fields
                         .iter()
-                        .filter_map(|field| entity.get(field))
+                        .filter_map(|field| row.entity.get(field))
                         .cloned()
                         .collect::<Vec<Value>>();
                     if !fulltext_field_values.is_empty() {
-                        fulltext.push((&column.field, Value::List(fulltext_field_values)));
+                        fulltext.push((column.field.as_str(), Value::List(fulltext_field_values)));
                     }
                 }
-                if !column.is_nullable() && !entity.contains_key(&column.field) {
+                if !fulltext.is_empty() {
+                    map.insert(row.id, fulltext);
+                }
+            }
+        }
+        Self(map)
+    }
+
+    fn get(&self, entity_id: &Word, field: &str) -> &Value {
+        self.0
+            .get(entity_id)
+            .and_then(|values| {
+                values
+                    .iter()
+                    .find(|(key, _)| field == *key)
+                    .map(|(_, value)| value)
+            })
+            .unwrap_or(&NULL)
+    }
+}
+
+#[derive(Debug)]
+pub struct InsertQuery<'a> {
+    table: &'a Table,
+    rows: &'a WriteChunk<'a>,
+    fulltext_values: FulltextValues<'a>,
+    unique_columns: Vec<&'a Column>,
+}
+
+impl<'a> InsertQuery<'a> {
+    pub fn new(table: &'a Table, rows: &'a WriteChunk<'a>) -> Result<InsertQuery<'a>, StoreError> {
+        for row in rows {
+            for column in table.columns.iter() {
+                if !column.is_nullable() && !row.entity.contains_key(&column.field) {
                     return Err(StoreError::QueryExecutionError(format!(
                     "can not insert entity {}[{}] since value for non-nullable attribute {} is missing. \
                      To fix this, mark the attribute as nullable in the GraphQL schema or change the \
                      mapping code to always set this attribute.",
-                    entity_key.entity_type, entity_key.entity_id, column.field
+                    table.object, row.id, column.field
                 )));
                 }
             }
-            if !fulltext.is_empty() {
-                entity.to_mut().merge_iter(fulltext)?;
-            }
         }
-        let unique_columns = InsertQuery::unique_columns(table, entities);
-        let br_column = BlockRangeColumn::new(table, "", block);
+
+        let fulltext_values = FulltextValues::new(table, rows);
+        let unique_columns = InsertQuery::unique_columns(table, rows, &fulltext_values);
 
         Ok(InsertQuery {
             table,
-            entities,
+            rows,
+            fulltext_values,
             unique_columns,
-            br_column,
         })
     }
 
     /// Build the column name list using the subset of all keys among present entities.
     fn unique_columns(
         table: &'a Table,
-        entities: &'a [(&'a EntityKey, Cow<'a, Entity>)],
+        rows: &'a WriteChunk<'a>,
+        fulltext_values: &FulltextValues<'a>,
     ) -> Vec<&'a Column> {
-        let mut hashmap = HashMap::new();
-        for (_key, entity) in entities.iter() {
-            for column in &table.columns {
-                if entity.get(&column.field).is_some() {
-                    hashmap.entry(column.name.as_str()).or_insert(column);
-                }
-            }
-        }
-        hashmap.into_values().collect()
+        table
+            .columns
+            .iter()
+            .filter(|column| {
+                rows.iter().any(|row| {
+                    if column.is_fulltext() {
+                        !fulltext_values.get(row.id, &column.field).is_null()
+                    } else {
+                        row.entity.get(&column.field).is_some()
+                    }
+                })
+            })
+            .collect()
     }
 
     /// Return the maximum number of entities that can be inserted with one
@@ -1834,6 +1864,25 @@ impl<'a> InsertQuery<'a> {
             }
         }
         POSTGRES_MAX_PARAMETERS / count
+    }
+
+    /// Output the literal value of the block range `[block,..)`, mostly for
+    /// generating an insert statement containing the block range column
+    pub fn literal_range_current(
+        table: &Table,
+        block: BlockNumber,
+        end: Option<BlockNumber>,
+        out: &mut AstPass<Pg>,
+    ) -> QueryResult<()> {
+        if table.immutable {
+            out.push_bind_param::<Integer, _>(&block)
+        } else {
+            let block_range: BlockRange = match end {
+                Some(end) => (block..end).into(),
+                None => (block..).into(),
+            };
+            out.push_bind_param::<Range<Integer>, _>(&block_range)
+        }
     }
 }
 
@@ -1859,7 +1908,8 @@ impl<'a> QueryFragment<Pg> for InsertQuery<'a> {
             out.push_identifier(column.name.as_str())?;
             out.push_sql(", ");
         }
-        self.br_column.name(&mut out);
+        out.push_sql(self.table.block_column().as_str());
+
         if self.table.has_causality_region {
             out.push_sql(", ");
             out.push_sql(CAUSALITY_REGION_COLUMN);
@@ -1868,23 +1918,22 @@ impl<'a> QueryFragment<Pg> for InsertQuery<'a> {
         out.push_sql(") values\n");
 
         // Use a `Peekable` iterator to help us decide how to finalize each line.
-        let mut iter = self.entities.iter().peekable();
-        while let Some((key, entity)) = iter.next() {
+        let mut iter = self.rows.iter().peekable();
+        while let Some(row) = iter.next() {
             out.push_sql("(");
             for column in &self.unique_columns {
-                // If the column name is not within this entity's fields, we will issue the
-                // null value in its place
-                if let Some(value) = entity.get(&column.field) {
-                    QueryValue(value, &column.column_type).walk_ast(out.reborrow())?;
+                let value = if column.is_fulltext() {
+                    self.fulltext_values.get(row.id, &column.field)
                 } else {
-                    out.push_sql("null");
-                }
+                    row.entity.get(&column.field).unwrap_or(&NULL)
+                };
+                QueryValue(value, &column.column_type).walk_ast(out.reborrow())?;
                 out.push_sql(", ");
             }
-            self.br_column.literal_range_current(&mut out)?;
+            Self::literal_range_current(&self.table, row.block, row.end, &mut out)?;
             if self.table.has_causality_region {
                 out.push_sql(", ");
-                out.push_bind_param::<Integer, _>(&key.causality_region)?;
+                out.push_bind_param::<Integer, _>(&row.causality_region)?;
             };
             out.push_sql(")");
 
@@ -1893,9 +1942,6 @@ impl<'a> QueryFragment<Pg> for InsertQuery<'a> {
                 out.push_sql(",\n");
             }
         }
-        out.push_sql("\nreturning ");
-        out.push_sql(PRIMARY_KEY_COLUMN);
-        out.push_sql("::text");
 
         Ok(())
     }
@@ -1905,13 +1951,6 @@ impl<'a> QueryId for InsertQuery<'a> {
     type QueryId = ();
 
     const HAS_STATIC_QUERY_ID: bool = false;
-}
-
-impl<'a> LoadQuery<PgConnection, ReturnedEntityData> for InsertQuery<'a> {
-    fn internal_load(self, conn: &PgConnection) -> QueryResult<Vec<ReturnedEntityData>> {
-        conn.query_by_name(&self)
-            .map(|data| ReturnedEntityData::bytes_as_str(self.table, data))
-    }
 }
 
 impl<'a, Conn> RunQueryDsl<Conn> for InsertQuery<'a> {}
